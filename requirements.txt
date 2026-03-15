@@ -1,13 +1,13 @@
-# 核心框架（锁定稳定版本）
+# 核心框架
 streamlit==1.32.0
-# 数据处理（适配Excel读取）
+# 数据处理
 pandas==2.2.0
-openpyxl==3.1.0
 numpy==1.24.3
-# 计量分析（关键！锁定兼容PanelUnitRootTest的版本）
+openpyxl==3.1.0
+# 计量分析（关键！锁定4.35版本，适配PanelUnitRootTest）
 linearmodels==4.35
 statsmodels==0.14.0
-# 机器学习（避免高版本兼容问题）
+# 机器学习
 xgboost==2.0.0
 lightgbm==4.1.0
 scikit-learn==1.2.0
@@ -15,6 +15,6 @@ scikit-learn==1.2.0
 matplotlib==3.8.0
 scipy==1.12.0
 plotly==5.17.0
-# 空间分析（补充此前缺失的依赖）
+# 空间分析
 pysal==25.0
 esda==2.5.0
