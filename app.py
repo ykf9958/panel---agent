@@ -12,14 +12,13 @@ from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.stats.diagnostic import het_breuschpagan
-from linearmodels.panel.unitroot import PanelUnitRootTest
 from linearmodels.panel.model import RandomEffects
 import warnings
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# 空间分析相关（需提前安装 pysal/esda）
+# 空间分析相关（容错处理）
 try:
     import pysal.lib as ps
     import esda
@@ -137,24 +136,36 @@ if df is not None and not df.empty:
                 group_desc = df_clean.groupby(region_col)[numeric_vars].agg(['mean', 'std', 'min', 'max']).round(4)
                 st.dataframe(group_desc, use_container_width=True)
             
-            # 3.1.2 面板单位根检验（表格输出）
+            # 3.1.2 面板单位根检验（兼容版，规避高版本报错）
             st.write("### 1.3 面板单位根检验（LLC）")
             unitroot_results = []
-            for var in numeric_vars:
-                try:
-                    unitroot_test = PanelUnitRootTest(df_clean[var], df_clean[id_col], df_clean[time_col], method='llc')
+            try:
+                # 适配linearmodels 4.35版本的单位根检验
+                from linearmodels.panel.unitroot import PanelUnitRootTest
+                for var in numeric_vars:
+                    try:
+                        unitroot_test = PanelUnitRootTest(df_clean[var], df_clean[id_col], df_clean[time_col], method='llc')
+                        unitroot_results.append({
+                            '变量': var,
+                            'LLC统计量': unitroot_test.statistic.round(4),
+                            'P值': unitroot_test.p_value.round(4),
+                            '是否平稳': '是' if unitroot_test.p_value < 0.05 else '否'
+                        })
+                    except Exception as e:
+                        unitroot_results.append({
+                            '变量': var,
+                            'LLC统计量': '计算失败',
+                            'P值': '计算失败',
+                            '是否平稳': f'错误：{str(e)[:20]}'
+                        })
+            except ImportError:
+                # 若仍导入失败，直接提示并跳过
+                for var in numeric_vars:
                     unitroot_results.append({
                         '变量': var,
-                        'LLC统计量': unitroot_test.statistic.round(4),
-                        'P值': unitroot_test.p_value.round(4),
-                        '是否平稳': '是' if unitroot_test.p_value < 0.05 else '否'
-                    })
-                except:
-                    unitroot_results.append({
-                        '变量': var,
-                        'LLC统计量': '计算失败',
-                        'P值': '计算失败',
-                        '是否平稳': '未知'
+                        'LLC统计量': '模块导入失败',
+                        'P值': '模块导入失败',
+                        '是否平稳': '请检查linearmodels版本（推荐4.35）'
                     })
             unitroot_df = pd.DataFrame(unitroot_results)
             st.dataframe(unitroot_df, use_container_width=True)
@@ -276,18 +287,21 @@ if df is not None and not df.empty:
                     for t in sorted(trend_df['relative_time'].unique()):
                         if t == 0: continue  # 基准期
                         trend_df[f't_{t}'] = (trend_df['relative_time'] == t).astype(int)
-                        trend_formula = f"{y_col} ~ 1 + {did_treat_col} + {' + '.join([f't_{i}' for i in sorted(trend_df['relative_time'].unique()) if i !=0])} + {did_treat_col}*({' + '.join([f't_{i}' for i in sorted(trend_df['relative_time'].unique()) if i !=0])}) + {' + '.join(X_cols)}"
+                        trend_terms = ' + '.join([f't_{i}' for i in sorted(trend_df['relative_time'].unique()) if i !=0])
+                        did_trend_terms = f"{did_treat_col}*({trend_terms})"
+                        trend_formula = f"{y_col} ~ 1 + {did_treat_col} + {trend_terms} + {did_trend_terms} + {' + '.join(X_cols)}"
                         trend_model = plm.PanelOLS.from_formula(trend_formula, trend_df.set_index([id_col, time_col])).fit()
-                        coef = trend_model.params[f'{did_treat_col}:t_{t}'] if f'{did_treat_col}:t_{t}' in trend_model.params else np.nan
-                        pval = trend_model.pvalues[f'{did_treat_col}:t_{t}'] if f'{did_treat_col}:t_{t}' in trend_model.pvalues else np.nan
+                        coef_key = f'{did_treat_col}:t_{t}'
+                        coef = trend_model.params[coef_key] if coef_key in trend_model.params else np.nan
+                        pval = trend_model.pvalues[coef_key] if coef_key in trend_model.pvalues else np.nan
                         trend_results.append({
                             '相对时间': t,
                             '系数': coef.round(4) if not np.isnan(coef) else 'N/A',
                             'P值': pval.round(4) if not np.isnan(pval) else 'N/A',
                             '是否显著': '是' if (not np.isnan(pval) and pval < 0.05) else '否'
                         })
-                except:
-                    trend_results.append({'相对时间': '计算失败', '系数': 'N/A', 'P值': 'N/A', '是否显著': 'N/A'})
+                except Exception as e:
+                    trend_results.append({'相对时间': f'计算失败: {str(e)[:20]}', '系数': 'N/A', 'P值': 'N/A', '是否显著': 'N/A'})
                 
                 st.write("#### DID核心结果")
                 st.dataframe(pd.DataFrame(did_results), use_container_width=True)
@@ -336,18 +350,23 @@ if df is not None and not df.empty:
                 })
                 
                 # Sobel检验（简化版）
-                sobel_z = (step1_model.params[X_cols[0]] * step3_model.params[mediator_col]) / np.sqrt(
-                    step3_model.params[mediator_col]**2 * step1_model.std_errors[X_cols[0]]**2 +
-                    step1_model.params[X_cols[0]]**2 * step3_model.std_errors[mediator_col]**2
-                )
-                sobel_pval = 2 * (1 - stats.norm.cdf(abs(sobel_z)))
+                try:
+                    sobel_z = (step1_model.params[X_cols[0]] * step3_model.params[mediator_col]) / np.sqrt(
+                        step3_model.params[mediator_col]**2 * step1_model.std_errors[X_cols[0]]**2 +
+                        step1_model.params[X_cols[0]]**2 * step3_model.std_errors[mediator_col]**2
+                    )
+                    sobel_pval = 2 * (1 - stats.norm.cdf(abs(sobel_z)))
+                except:
+                    sobel_z = np.nan
+                    sobel_pval = np.nan
+                
                 mediator_conclusion = pd.DataFrame({
                     '检验方法': ['逐步回归法', 'Sobel检验'],
-                    '统计量': ['-', sobel_z.round(4)],
-                    'P值': ['-', sobel_pval.round(4)],
+                    '统计量': ['-', sobel_z.round(4) if not np.isnan(sobel_z) else 'N/A'],
+                    'P值': ['-', sobel_pval.round(4) if not np.isnan(sobel_pval) else 'N/A'],
                     '结论': [
                         '部分中介' if (step1_model.pvalues[X_cols[0]]<0.05 and step2_model.pvalues[X_cols[0]]<0.05 and step3_model.pvalues[mediator_col]<0.05 and abs(step3_model.params[X_cols[0]])<abs(step1_model.params[X_cols[0]])) else '完全中介' if (step1_model.pvalues[X_cols[0]]<0.05 and step2_model.pvalues[X_cols[0]]<0.05 and step3_model.pvalues[mediator_col]<0.05 and step3_model.pvalues[X_cols[0]]>=0.05) else '无中介效应',
-                        '显著' if sobel_pval < 0.05 else '不显著'
+                        '显著' if (not np.isnan(sobel_pval) and sobel_pval < 0.05) else '不显著' if not np.isnan(sobel_pval) else '计算失败'
                     ]
                 })
                 
@@ -372,8 +391,8 @@ if df is not None and not df.empty:
                         ]
                     })
                     st.dataframe(moran_results, use_container_width=True)
-                except:
-                    st.warning("⚠️ 空间权重矩阵构建失败，跳过空间分析")
+                except Exception as e:
+                    st.warning(f"⚠️ 空间权重矩阵构建失败：{str(e)[:50]}，跳过空间分析")
 
             # 3.3 机器学习模型分析（表格化对比）
             st.subheader("🤖 三、机器学习模型对比分析")
@@ -394,57 +413,73 @@ if df is not None and not df.empty:
             # 模型训练与评估（表格化）
             model_metrics = []
             for name, model in models.items():
-                model.fit(X_train, y_train)
-                y_pred = model.predict(X_test)
-                r2 = r2_score(y_test, y_pred)
-                rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-                mae = mean_absolute_error(y_test, y_pred)
-                # 5折交叉验证
-                cv_r2 = cross_val_score(model, X_ml, y_ml, cv=5, scoring='r2').mean()
-                model_metrics.append({
-                    "模型": name,
-                    "测试集R²": r2.round(4),
-                    "测试集RMSE": rmse.round(4),
-                    "测试集MAE": mae.round(4),
-                    "5折交叉验证R²": cv_r2.round(4),
-                    "排序": 0  # 后续排序用
-                })
+                try:
+                    model.fit(X_train, y_train)
+                    y_pred = model.predict(X_test)
+                    r2 = r2_score(y_test, y_pred)
+                    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+                    mae = mean_absolute_error(y_test, y_pred)
+                    # 5折交叉验证
+                    cv_r2 = cross_val_score(model, X_ml, y_ml, cv=5, scoring='r2').mean()
+                    model_metrics.append({
+                        "模型": name,
+                        "测试集R²": r2.round(4),
+                        "测试集RMSE": rmse.round(4),
+                        "测试集MAE": mae.round(4),
+                        "5折交叉验证R²": cv_r2.round(4),
+                        "排序": 0  # 后续排序用
+                    })
+                except Exception as e:
+                    model_metrics.append({
+                        "模型": name,
+                        "测试集R²": '训练失败',
+                        "测试集RMSE": '训练失败',
+                        "测试集MAE": '训练失败',
+                        "5折交叉验证R²": '训练失败',
+                        "排序": 999
+                    })
             
             # 排序
             metrics_df = pd.DataFrame(model_metrics)
-            metrics_df['排序'] = metrics_df['测试集R²'].rank(ascending=False).astype(int)
+            # 仅对数值型R²排序
+            numeric_r2 = metrics_df['测试集R²'].apply(lambda x: isinstance(x, (int, float)))
+            metrics_df.loc[numeric_r2, '排序'] = metrics_df.loc[numeric_r2, '测试集R²'].rank(ascending=False).astype(int)
             metrics_df = metrics_df.sort_values('排序')
             
             st.dataframe(metrics_df, use_container_width=True)
             
             # 最优模型变量重要性（表格+可视化）
-            best_model_name = metrics_df.loc[metrics_df['排序']==1, '模型'].iloc[0]
-            best_model = models[best_model_name]
-            st.write(f"### 3.1 最优模型（{best_model_name}）变量重要性")
-            
-            if hasattr(best_model, 'feature_importances_'):
-                imp_df = pd.DataFrame({
-                    '变量': X_cols,
-                    '重要性': best_model.feature_importances_,
-                    '重要性排名': best_model.feature_importances_.argsort()[::-1]+1
-                }).sort_values('重要性排名').round(4)
-                st.dataframe(imp_df, use_container_width=True)
+            valid_models = metrics_df[metrics_df['测试集R²'] != '训练失败']
+            if not valid_models.empty:
+                best_model_name = valid_models.loc[valid_models['排序']==1, '模型'].iloc[0]
+                best_model = models[best_model_name]
+                st.write(f"### 3.1 最优模型（{best_model_name}）变量重要性")
                 
-                # 可视化
-                fig, ax = plt.subplots(figsize=(12, 6))
-                ax.barh(imp_df['变量'][:10], imp_df['重要性'][:10], color='#2ecc71')
-                ax.set_xlabel('Importance')
-                ax.set_title(f'{best_model_name} Feature Importance (Top 10)')
-                st.pyplot(fig)
+                if hasattr(best_model, 'feature_importances_'):
+                    imp_df = pd.DataFrame({
+                        '变量': X_cols,
+                        '重要性': best_model.feature_importances_,
+                        '重要性排名': best_model.feature_importances_.argsort()[::-1]+1
+                    }).sort_values('重要性排名').round(4)
+                    st.dataframe(imp_df, use_container_width=True)
+                    
+                    # 可视化
+                    fig, ax = plt.subplots(figsize=(12, 6))
+                    ax.barh(imp_df['变量'][:10], imp_df['重要性'][:10], color='#2ecc71')
+                    ax.set_xlabel('Importance')
+                    ax.set_title(f'{best_model_name} Feature Importance (Top 10)')
+                    st.pyplot(fig)
+                else:
+                    # 线性模型系数绝对值作为重要性
+                    coef_df = pd.DataFrame({
+                        '变量': X_cols,
+                        '系数': best_model.coef_,
+                        '系数绝对值': np.abs(best_model.coef_),
+                        '重要性排名': np.abs(best_model.coef_).argsort()[::-1]+1
+                    }).sort_values('重要性排名').round(4)
+                    st.dataframe(coef_df, use_container_width=True)
             else:
-                # 线性模型系数绝对值作为重要性
-                coef_df = pd.DataFrame({
-                    '变量': X_cols,
-                    '系数': best_model.coef_,
-                    '系数绝对值': np.abs(best_model.coef_),
-                    '重要性排名': np.abs(best_model.coef_).argsort()[::-1]+1
-                }).sort_values('重要性排名').round(4)
-                st.dataframe(coef_df, use_container_width=True)
+                st.warning("⚠️ 所有机器学习模型训练失败，请检查数据格式")
 
             # 3.4 稳健性检验（表格化）
             st.subheader("🛡️ 四、稳健性检验")
@@ -469,8 +504,8 @@ if df is not None and not df.empty:
                             '是否显著': '是' if robust_model.pvalues[var]<0.05 else '否',
                             'R²': robust_model.rsquared.round(4)
                         })
-            except:
-                robust_results.append({'检验方法': '核心变量滞后一期', '变量': '计算失败', '系数': 'N/A', 'P值': 'N/A', '是否显著': 'N/A', 'R²': 'N/A'})
+            except Exception as e:
+                robust_results.append({'检验方法': '核心变量滞后一期', '变量': f'计算失败: {str(e)[:20]}', '系数': 'N/A', 'P值': 'N/A', '是否显著': 'N/A', 'R²': 'N/A'})
             
             # 方法2：剔除异常值（5%缩尾）
             st.write("### 4.2 5%缩尾检验")
@@ -490,8 +525,8 @@ if df is not None and not df.empty:
                             '是否显著': '是' if trim_model.pvalues[var]<0.05 else '否',
                             'R²': trim_model.rsquared.round(4)
                         })
-            except:
-                robust_results.append({'检验方法': '5%缩尾', '变量': '计算失败', '系数': 'N/A', 'P值': 'N/A', '是否显著': 'N/A', 'R²': 'N/A'})
+            except Exception as e:
+                robust_results.append({'检验方法': '5%缩尾', '变量': f'计算失败: {str(e)[:20]}', '系数': 'N/A', 'P值': 'N/A', '是否显著': 'N/A', 'R²': 'N/A'})
             
             st.dataframe(pd.DataFrame(robust_results), use_container_width=True)
 
